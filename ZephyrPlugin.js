@@ -27,7 +27,6 @@ function isValid( task ) {
   return !( ( task == undefined ) || (task == 0) );
 }
 
-
 function get_tcb(hTask) {
   return Debug.evaluate("*(k_thread*)" + hTask);
 }
@@ -125,6 +124,45 @@ function get_thread_name(hTask) {
   return "invalid";
 }
 
+function get_thread_stack_size(hTask) {
+  return get_tcb(hTask).stack_info.size;
+}
+
+function get_thread_stack_used(hTask) {
+  var task  =  get_tcb(hTask);
+  var UsedSpace;
+  var stack;
+
+  stack      = TargetInterface.peekBytes(task.stack_info.start, task.stack_info.size)
+  UsedSpace  =  0;      
+
+  if (stack == undefined) {
+    return undefined
+  }
+
+  // Same implementation as found in z_stack_space_get() in zephyr/kernel/thread.c
+  for (var i = 0; i < task.stack_info.size; i++) {
+    if (stack[i] != 170) {
+      UsedSpace += 1;
+    }
+  }
+  
+  return UsedSpace;
+}
+
+function format_stack_usage_bar(used, size) {
+    var usage = (used / size) * 30;
+    var usage_str = "["
+    for (var i = 0; i < 30; i++) {
+        if (i < usage) {
+            usage_str += "0"
+        } else {
+            usage_str += "  "
+        }
+    }
+    usage_str += "]"
+    return usage_str
+}
 
 function updateThreads() {
   if (Threads.newqueue2 == undefined) {
@@ -146,19 +184,31 @@ function updateThreads() {
   while ( isValid(ptask) ) {
     var task = get_tcb(ptask);
 
-    var task_name = get_thread_name(ptask);
-    var tid       = get_thread_tid(ptask);
-    var entry     = get_thread_entry(ptask);
-    var prio      = get_thread_prio(ptask).toString();
+    var task_name   = get_thread_name(ptask);
+    var tid         = get_thread_tid(ptask);
+    var entry       = get_thread_entry(ptask);
+    var prio        = get_thread_prio(ptask).toString();
+    var stack_ptr = task.callee_saved.psp;
+    var stack_size = get_thread_stack_size(ptask);
+    var stack_used = get_thread_stack_used(ptask);
+    var stack_free = (stack_size - stack_used);
+    var stack_usage_bar = format_stack_usage_bar(stack_used, stack_size)
 
     var status;
     if (current_ptask == ptask)    status = "Executing";
     else if (idle_ptask == ptask)  status = "Ready";
     else                           status = get_thread_state(ptask);
 
-    var SP = task.callee_saved.psp;
-
-    Threads.add( task_name, tid, entry, prio, status, "0x" + SP.toString(16), (current_ptask == ptask) ? undefined : ptask);
+    Threads.add( 
+        task_name, 
+        tid, 
+        entry, 
+        prio, 
+        status, 
+        "0x" + stack_ptr.toString(16), 
+        "0x" + stack_size.toString(16), 
+        stack_usage_bar + " 0x" + stack_used.toString(16) + " / 0x" + stack_free.toString(16), 
+        (current_ptask == ptask) ? undefined : ptask);
 
     ptask = task.next_thread;
   }
@@ -189,7 +239,7 @@ function init() {
   
   // Init the theads table
   Threads.newqueue("Task List");
-  Threads.setColumns("Threads", "TID", "Entry", "Priority", "Status", "Stack" );
+  Threads.setColumns("Threads", "TID", "Entry", "Priority", "Status", "Stack", "Size", "Stack Usage");
   
   Threads.setSortByNumber("TID");
   Threads.setSortByNumber("Priority");
@@ -248,9 +298,9 @@ function getregs(hTask) {
 
   var task  =  get_tcb(hTask);
   //
-  // Restore task stack (SP) from thread
+  // Restore task stack (stack_ptr) from thread
   //
-  var SP = task.callee_saved.psp;
+  var stack_ptr = task.callee_saved.psp;
   //
   // Restore R4-R11 from thread
   //
@@ -266,17 +316,17 @@ function getregs(hTask) {
   // Restore automatically saved R0-R3, and R12, LR, PC, xPSR from task stack
   //
   for (var i = 0; i < 4; i++){                    // R0..R3
-      regs[i] = TargetInterface.peekWord(SP);
-      SP += 4;
+      regs[i] = TargetInterface.peekWord(stack_ptr);
+      stack_ptr += 4;
   }
-  regs[12] = TargetInterface.peekWord(SP);        // IP
-  SP += 4;
-  regs[14] = TargetInterface.peekWord(SP);        // LR
-  SP += 4;
-  regs[15] = TargetInterface.peekWord(SP);        // PC = return address
-  SP += 4;
-  regs[16] = TargetInterface.peekWord(SP);        // xPSR
-  SP += 4;
+  regs[12] = TargetInterface.peekWord(stack_ptr);        // IP
+  stack_ptr += 4;
+  regs[14] = TargetInterface.peekWord(stack_ptr);        // LR
+  stack_ptr += 4;
+  regs[15] = TargetInterface.peekWord(stack_ptr);        // PC = return address
+  stack_ptr += 4;
+  regs[16] = TargetInterface.peekWord(stack_ptr);        // xPSR
+  stack_ptr += 4;
   //
   // Restore saved FPU registers.
   //
@@ -286,12 +336,12 @@ function getregs(hTask) {
     // FPU was active for this thread, so restore the FP-registers
     // restore S0..S15, FPSCR from stack
     for( var i=0; i<16; ++i ) {
-        regs[S0ofs + i]  = TargetInterface.peekWord(SP);             // S0..15
-        SP += 4;
+        regs[S0ofs + i]  = TargetInterface.peekWord(stack_ptr);             // S0..15
+        stack_ptr += 4;
     }
-    regs[FPSCR]          = TargetInterface.peekWord(SP);             // FPSCR
-    SP += 4;
-    SP += 4; // Dummy read
+    regs[FPSCR]          = TargetInterface.peekWord(stack_ptr);             // FPSCR
+    stack_ptr += 4;
+    stack_ptr += 4; // Dummy read
     
     // restore S16..S31 form thread->arch.preempt_float
     for( var i=0; i<16; ++i ) {
@@ -299,20 +349,20 @@ function getregs(hTask) {
     }
   //}
   //
-  // 8 byte aligned SP in interrupt entry enabled? (Set in xPSR[9])
-  // Increment SP after reading registers before accessing further variables from stack
+  // 8 byte aligned stack_ptr in interrupt entry enabled? (Set in xPSR[9])
+  // Increment stack_ptr after reading registers before accessing further variables from stack
   //
   if (regs[16] & (1<<9)) { 
-    if ((SP % 8) != 0) { // Check is stack is already aligned
-      // enforce SP 8 byte alignement
-      SP += 4;
+    if ((stack_ptr % 8) != 0) { // Check is stack is already aligned
+      // enforce stack_ptr 8 byte alignement
+      stack_ptr += 4;
     }
   }
   //
-  // Restore SP after adjusting for saved registers. 
+  // Restore stack_ptr after adjusting for saved registers. 
   // Now points to function stack frame.
   //
-  regs[13] = SP;
+  regs[13] = stack_ptr;
 
   return regs;
 }
